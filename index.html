@@ -994,24 +994,26 @@ inpEl.addEventListener('input', () => {
 /* ══════════════════════════════════════
    VOICE — OpenAI Realtime via WebSocket
 ══════════════════════════════════════ */
-const WS_URL = 'wss://optidigital-backend-production.up.railway.app/ws/voice';
-const SAMPLE_RATE = 24000;
+const WS_URL        = 'wss://optidigital-backend-production.up.railway.app/ws/voice';
+const OPENAI_RATE   = 24000; // OpenAI expects 24 kHz PCM16
 
 let voiceWs        = null;
 let mediaStream    = null;
-let audioCtx       = null;
+let captureCtx     = null; // native-rate context for mic capture + resampling
+let playbackCtx    = null; // 24 kHz context for audio playback
 let scriptProc     = null;
 let voiceState     = 'idle';
 let audioQueue     = [];
 let isPlayingAudio = false;
 let userTranscript = '';
 let botTranscript  = '';
+let activeWsRef    = null; // identity guard: the WS we own right now
 
 const micBtn = document.getElementById('mic-btn');
 
 function setVoiceState(state) {
   voiceState = state;
-  micBtn.classList.remove('rec','speaking');
+  micBtn.classList.remove('rec', 'speaking');
   if(state === 'recording') micBtn.classList.add('rec');
   if(state === 'speaking')  micBtn.classList.add('speaking');
 }
@@ -1026,70 +1028,124 @@ async function toggleVoice() {
 }
 
 async function startVoice() {
+  // Prevent double-start
+  if(voiceState !== 'idle') return;
+
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch(e) {
     addMsg('bot', '🎙️ Немає доступу до мікрофона. Дозвольте доступ у браузері.');
     return;
   }
 
+  // Scroll chat into view
   const el = document.querySelector('#chat .cbox');
-  const offset = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--hh')) || 56;
-  const top = el.getBoundingClientRect().top + window.scrollY - offset - 16;
-  window.scrollTo({top, behavior:'smooth'});
+  if(el) {
+    const offset = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--hh')) || 56;
+    const top = el.getBoundingClientRect().top + window.scrollY - offset - 16;
+    window.scrollTo({ top, behavior: 'smooth' });
+  }
   if(!chatActive) activateFirstMessage();
 
-  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-  voiceWs  = new WebSocket(WS_URL);
-  voiceWs.binaryType = 'arraybuffer';
+  // Two separate AudioContexts:
+  // captureCtx — runs at the browser's native rate so mic capture works reliably
+  // playbackCtx — runs at 24 kHz for direct PCM16 playback without pitch issues
+  captureCtx  = new AudioContext();           // native rate (44100 / 48000)
+  playbackCtx = new AudioContext({ sampleRate: OPENAI_RATE });
 
-  voiceWs.onopen = () => {
+  const ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+  voiceWs    = ws;
+  activeWsRef = ws; // remember which WS belongs to this session
+
+  ws.onopen = () => {
+    // Guard: if the user already clicked stop before onopen fired
+    if(activeWsRef !== ws) { ws.close(); return; }
     setVoiceState('recording');
     startMicCapture();
     addMsg('bot', '<span style="opacity:.5;font-size:12px">🎙️ Слухаю... Говоріть, я вас чую.</span>');
   };
 
-  voiceWs.onmessage = (evt) => {
+  ws.onmessage = (evt) => {
     if(typeof evt.data === 'string') {
       try { handleRealtimeEvent(JSON.parse(evt.data)); } catch(e) {}
     }
   };
 
-  voiceWs.onerror = () => {
+  ws.onerror = (e) => {
+    // Only react if this is still our active WS
+    if(activeWsRef !== ws) return;
     addMsg('bot', "Помилка голосового з'єднання. Спробуйте ще раз.");
     stopVoice();
   };
 
-  voiceWs.onclose = () => {
+  ws.onclose = () => {
+    // Only react if this is still our active WS and we haven't already stopped
+    if(activeWsRef !== ws) return;
     if(voiceState !== 'idle') stopVoice();
   };
 }
 
 function startMicCapture() {
-  const source = audioCtx.createMediaStreamSource(mediaStream);
-  scriptProc = audioCtx.createScriptProcessor(4096, 1, 1);
+  const nativeRate = captureCtx.sampleRate; // e.g. 44100 or 48000
+  const source     = captureCtx.createMediaStreamSource(mediaStream);
+
+  // Buffer size: larger = more stable on slow machines
+  scriptProc = captureCtx.createScriptProcessor(4096, 1, 1);
 
   scriptProc.onaudioprocess = (e) => {
     if(voiceState !== 'recording' || !voiceWs || voiceWs.readyState !== WebSocket.OPEN) return;
-    const float32 = e.inputBuffer.getChannelData(0);
-    const pcm16   = float32ToPcm16(float32);
-    const b64     = arrayBufferToBase64(pcm16.buffer);
+
+    const float32Native = e.inputBuffer.getChannelData(0);
+
+    // Downsample from native rate to 24000 Hz
+    const float32 = downsample(float32Native, nativeRate, OPENAI_RATE);
+
+    const pcm16 = float32ToPcm16(float32);
+    const b64   = arrayBufferToBase64(pcm16.buffer);
     voiceWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
   };
 
   source.connect(scriptProc);
-  scriptProc.connect(audioCtx.destination);
+  // Connect to destination to keep the graph alive (required by Chrome)
+  scriptProc.connect(captureCtx.destination);
+}
+
+/* Linear downsampler — accurate enough for voice */
+function downsample(buffer, fromRate, toRate) {
+  if(fromRate === toRate) return buffer;
+  const ratio    = fromRate / toRate;
+  const outLen   = Math.floor(buffer.length / ratio);
+  const out      = new Float32Array(outLen);
+  for(let i = 0; i < outLen; i++) {
+    // Simple point-sample (sufficient for speech; avoids aliasing artefacts at voice freq)
+    const srcIdx = Math.min(Math.floor(i * ratio), buffer.length - 1);
+    out[i] = buffer[srcIdx];
+  }
+  return out;
 }
 
 function handleRealtimeEvent(ev) {
   switch(ev.type) {
 
+    case 'session.created':
+    case 'session.updated':
+      // Session ready — nothing to do on frontend
+      break;
+
     case 'input_audio_buffer.speech_started':
       userTranscript = '';
+      // If AI was playing audio, stop it and go back to recording
+      if(voiceState === 'speaking') {
+        audioQueue = [];
+        isPlayingAudio = false;
+        setVoiceState('recording');
+      }
       break;
 
     case 'input_audio_buffer.speech_stopped':
-      setVoiceState('speaking');
+      // VAD detected end of user speech — AI is now processing
+      if(voiceState === 'recording') setVoiceState('speaking');
       break;
 
     case 'conversation.item.input_audio_transcription.completed':
@@ -1099,8 +1155,8 @@ function handleRealtimeEvent(ev) {
 
     case 'response.audio.delta':
       if(ev.delta) {
-        const pcm = base64ToFloat32(ev.delta);
-        audioQueue.push(pcm);
+        const samples = base64ToFloat32(ev.delta);
+        audioQueue.push(samples);
         if(!isPlayingAudio) playNextChunk();
       }
       break;
@@ -1114,19 +1170,20 @@ function handleRealtimeEvent(ev) {
         addMsg('bot', botTranscript);
         botTranscript = '';
       }
-      setTimeout(() => {
-        if(voiceState === 'speaking') setVoiceState('recording');
-      }, 400);
+      break;
+
+    case 'response.audio.done':
+      // All audio chunks have been sent; wait for queue to drain, then go back to recording
+      waitForPlaybackThenRecord();
       break;
 
     case 'response.done':
+      // Flush any remaining transcript
       if(botTranscript.trim()) {
         addMsg('bot', botTranscript);
         botTranscript = '';
       }
-      setTimeout(() => {
-        if(voiceState === 'speaking') setVoiceState('recording');
-      }, 600);
+      waitForPlaybackThenRecord();
       break;
 
     case 'error':
@@ -1136,38 +1193,73 @@ function handleRealtimeEvent(ev) {
   }
 }
 
+/* Poll until audio queue is empty, then return to recording state */
+function waitForPlaybackThenRecord() {
+  const check = () => {
+    if(!isPlayingAudio && audioQueue.length === 0) {
+      if(voiceState === 'speaking') setVoiceState('recording');
+    } else {
+      setTimeout(check, 150);
+    }
+  };
+  setTimeout(check, 150);
+}
+
 function addVoiceUserMsg(text) {
   const d = document.createElement('div');
   d.className = 'msg u';
-  d.innerHTML = '<div class="mav"><span>Ви</span></div><div class="mb"><span class="voice-msg-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V20H9v2h6v-2h-2v-2.07A7 7 0 0 0 19 11h-2z"/></svg> голосове</span><br/>' + text + '</div>';
+  d.innerHTML = '<div class="mav"><span>Ви</span></div>'
+    + '<div class="mb"><span class="voice-msg-badge">'
+    + '<svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11">'
+    + '<path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z'
+    + 'm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V20H9v2h6v-2h-2v-2.07A7 7 0 0 0 19 11h-2z"/>'
+    + '</svg> голосове</span><br/>' + text + '</div>';
   msgsEl.appendChild(d);
   msgsEl.scrollTop = msgsEl.scrollHeight;
   chipsEl.style.display = 'none';
 }
 
 function playNextChunk() {
-  if(audioQueue.length === 0) { isPlayingAudio = false; return; }
+  if(!playbackCtx || audioQueue.length === 0) { isPlayingAudio = false; return; }
   isPlayingAudio = true;
   const samples = audioQueue.shift();
-  const buf = audioCtx.createBuffer(1, samples.length, SAMPLE_RATE);
+  const buf = playbackCtx.createBuffer(1, samples.length, OPENAI_RATE);
   buf.getChannelData(0).set(samples);
-  const src = audioCtx.createBufferSource();
+  const src = playbackCtx.createBufferSource();
   src.buffer = buf;
-  src.connect(audioCtx.destination);
+  src.connect(playbackCtx.destination);
   src.onended = playNextChunk;
   src.start();
 }
 
 function stopVoice() {
+  // Mark this session as done so stale onclose/onerror callbacks are ignored
+  activeWsRef = null;
+
   setVoiceState('idle');
-  if(scriptProc) { scriptProc.disconnect(); scriptProc = null; }
-  if(mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-  if(audioCtx)   { audioCtx.close(); audioCtx = null; }
-  if(voiceWs && voiceWs.readyState === WebSocket.OPEN) voiceWs.close();
-  voiceWs = null;
-  audioQueue = [];
+
+  if(scriptProc)   { try { scriptProc.disconnect(); } catch(e){} scriptProc = null; }
+  if(mediaStream)  { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if(captureCtx)   { try { captureCtx.close(); }  catch(e){} captureCtx  = null; }
+  if(playbackCtx)  { try { playbackCtx.close(); } catch(e){} playbackCtx = null; }
+
+  if(voiceWs) {
+    const ws = voiceWs;
+    voiceWs = null; // null first to prevent re-entry
+    try {
+      if(ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    } catch(e) {}
+  }
+
+  audioQueue     = [];
   isPlayingAudio = false;
+  botTranscript  = '';
+  userTranscript = '';
 }
+
+/* ── Audio utilities ── */
 
 function float32ToPcm16(f32) {
   const out = new Int16Array(f32.length);
@@ -1179,9 +1271,13 @@ function float32ToPcm16(f32) {
 }
 
 function arrayBufferToBase64(buf) {
-  let bin = '';
+  // Chunk to avoid call stack overflow on large buffers
   const bytes = new Uint8Array(buf);
-  for(let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  let bin = '';
+  const chunk = 8192;
+  for(let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
   return btoa(bin);
 }
 
