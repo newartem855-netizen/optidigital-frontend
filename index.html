@@ -499,7 +499,7 @@ footer .ct{display:flex;align-items:center;justify-content:space-between;flex-wr
   .ico{display:none}
   /* header becomes: logo | center-status | cta-button */
   header{grid-template-columns:auto 1fr auto;gap:6px;padding:0 12px}
-  .h-left{gap:6px;min-width:0}
+  .h-left{gap:6px}
   .ln{font-size:12px}
   .ab{font-size:8px;padding:2px 6px}
   .hcta{font-size:10px;padding:0 10px;height:28px;white-space:nowrap}
@@ -781,12 +781,30 @@ footer .ct{display:flex;align-items:center;justify-content:space-between;flex-wr
 </div><!-- /wrap -->
 
 <script>
+try {
+
 /* ── REVEAL ── */
-const obs = new IntersectionObserver(
-  es => es.forEach(e => { if(e.isIntersecting) e.target.classList.add('on') }),
-  {threshold:.08}
-);
-document.querySelectorAll('.r').forEach(el => obs.observe(el));
+/* Fallback: if IntersectionObserver doesn't fire (local file on iOS), show all after 800ms */
+const revealEls = document.querySelectorAll('.r');
+const revealFallback = setTimeout(() => {
+  revealEls.forEach(el => el.classList.add('on'));
+}, 800);
+
+if('IntersectionObserver' in window) {
+  const obs = new IntersectionObserver(
+    es => es.forEach(e => { if(e.isIntersecting) e.target.classList.add('on') }),
+    {threshold:.08}
+  );
+  revealEls.forEach(el => obs.observe(el));
+  /* if first element becomes visible, observer is working — cancel fallback */
+  const firstObs = new IntersectionObserver(entries => {
+    if(entries[0].isIntersecting) { clearTimeout(revealFallback); firstObs.disconnect(); }
+  }, {threshold:.01});
+  if(revealEls[0]) firstObs.observe(revealEls[0]);
+} else {
+  clearTimeout(revealFallback);
+  revealEls.forEach(el => el.classList.add('on'));
+}
 
 /* ── SCROLL OFFSET for fixed header ── */
 document.getElementById('hero-chat-btn').addEventListener('click', e => {
@@ -799,24 +817,25 @@ function scrollToChat() {
   const offset = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--hh')) || 56;
   const top = el.getBoundingClientRect().top + window.scrollY - offset - 16;
   window.scrollTo({top, behavior:'smooth'});
-  // trigger first message after scroll lands
   setTimeout(activateFirstMessage, 500);
 }
 
 /* ── CHAT STATE ── */
-const msgsEl   = document.getElementById('msgs');
-const inpEl    = document.getElementById('inp');
-const chipsEl  = document.getElementById('chips');
+const msgsEl  = document.getElementById('msgs');
+const inpEl   = document.getElementById('inp');
+const chipsEl = document.getElementById('chips');
 let chatActive = false;
 
 /* Activate on scroll into chat viewport */
-const chatObs = new IntersectionObserver(entries => {
-  if(entries[0].isIntersecting && !chatActive) {
-    activateFirstMessage();
-    chatObs.disconnect();
-  }
-}, {threshold:.35});
-chatObs.observe(document.getElementById('chat'));
+if('IntersectionObserver' in window) {
+  const chatObs = new IntersectionObserver(entries => {
+    if(entries[0].isIntersecting && !chatActive) {
+      activateFirstMessage();
+      chatObs.disconnect();
+    }
+  }, {threshold:.25});
+  chatObs.observe(document.getElementById('chat'));
+}
 
 function activateFirstMessage() {
   if(chatActive) return;
@@ -825,7 +844,10 @@ function activateFirstMessage() {
   if(empty) {
     empty.style.transition = 'opacity .25s';
     empty.style.opacity = '0';
-    setTimeout(() => { if(empty.parentNode) empty.parentNode.removeChild(empty); addMsg('bot', 'Привіт. Я AI-менеджер OptiDigital.<br/>Запитайте про послуги, підхід, вартість або запуск — відповім на будь-яке питання про агентство.'); }, 260);
+    setTimeout(() => {
+      if(empty.parentNode) empty.parentNode.removeChild(empty);
+      addMsg('bot', 'Привіт. Я AI-менеджер OptiDigital.<br/>Запитайте про послуги, підхід, вартість або запуск — відповім на будь-яке питання про агентство.');
+    }, 260);
   }
 }
 
@@ -841,19 +863,21 @@ function activateChat(text) {
 
 function addMsg(role, html) {
   const d = document.createElement('div');
-  d.className = `msg ${role === 'bot' ? 'b' : 'u'}`;
-  d.innerHTML = `<div class="mav">${role === 'bot' ? '<span style="font-size:10px;font-weight:800;color:#0d0d0d">OD</span>' : '<span>Ви</span>'}</div><div class="mb">${html}</div>`;
+  d.className = 'msg ' + (role === 'bot' ? 'b' : 'u');
+  d.innerHTML = '<div class="mav">' + (role === 'bot' ? '<span style="font-size:10px;font-weight:800;color:#0d0d0d">OD</span>' : '<span>Ви</span>') + '</div><div class="mb">' + html + '</div>';
   msgsEl.appendChild(d);
-  msgsEl.scrollTop = msgsEl.scrollHeight;
-  // hide chips after first user message
+  /* скролл только внутри блока сообщений, не двигаем страницу */
+  requestAnimationFrame(() => { msgsEl.scrollTop = msgsEl.scrollHeight; });
   if(role === 'user') chipsEl.style.display = 'none';
 }
 
 /* ── SESSION ── */
 function getSession() {
-  let s = sessionStorage.getItem('od_sid');
-  if(!s) { s = 'u_' + Math.random().toString(36).slice(2,9); sessionStorage.setItem('od_sid', s); }
-  return s;
+  try {
+    let s = sessionStorage.getItem('od_sid');
+    if(!s) { s = 'u_' + Math.random().toString(36).slice(2,9); sessionStorage.setItem('od_sid', s); }
+    return s;
+  } catch(e) { return 'u_' + Math.random().toString(36).slice(2,9); }
 }
 
 /* ── SEND ── */
@@ -863,18 +887,17 @@ async function handleSend() {
   if(!text) return;
   inpEl.value = '';
   inpEl.style.height = '44px';
-  // blur to dismiss iOS keyboard and prevent zoom
+  /* blur = dismiss keyboard on iOS, prevents zoom */
   inpEl.blur();
   addMsg('user', text);
 
-  // typing indicator
   const tid = 'typing-' + Date.now();
   const td = document.createElement('div');
   td.className = 'msg b';
   td.id = tid;
-  td.innerHTML = `<div class="mav"><span style="font-size:10px;font-weight:800;color:#0d0d0d">OD</span></div><div class="mb" style="opacity:.4;letter-spacing:.15em;font-size:18px">· · ·</div>`;
+  td.innerHTML = '<div class="mav"><span style="font-size:10px;font-weight:800;color:#0d0d0d">OD</span></div><div class="mb" style="opacity:.4;letter-spacing:.15em;font-size:18px">· · ·</div>';
   msgsEl.appendChild(td);
-  msgsEl.scrollTop = msgsEl.scrollHeight;
+  requestAnimationFrame(() => { msgsEl.scrollTop = msgsEl.scrollHeight; });
 
   try {
     const res = await fetch('https://optidigital-backend-production.up.railway.app/api/chat', {
@@ -883,26 +906,37 @@ async function handleSend() {
       body: JSON.stringify({ message: text, sessionId: getSession() })
     });
     const data = await res.json();
-    document.getElementById(tid)?.remove();
+    document.getElementById(tid) && document.getElementById(tid).remove();
     addMsg('bot', data.reply || 'Вибач, сталась помилка. Спробуй ще раз.');
   } catch(e) {
-    document.getElementById(tid)?.remove();
+    document.getElementById(tid) && document.getElementById(tid).remove();
     addMsg('bot', 'Не вдалось зʼєднатись із сервером. Напишіть нам напряму — відповімо швидко.');
   }
-  // after reply lands, scroll chat box into view (not the page zoom)
+
+  /* после отправки — держим cbox в зоне видимости, не улетаем вниз */
   setTimeout(() => {
     const cbox = document.querySelector('#chat .cbox');
+    if(!cbox) return;
     const hh = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--hh')) || 56;
-    const top = cbox.getBoundingClientRect().top + window.scrollY - hh - 16;
-    window.scrollTo({top, behavior:'smooth'});
-  }, 100);
+    const rect = cbox.getBoundingClientRect();
+    /* если верх cbox уехал выше хедера — корректируем */
+    if(rect.top < hh + 8) {
+      window.scrollTo({top: cbox.getBoundingClientRect().top + window.scrollY - hh - 16, behavior:'smooth'});
+    }
+  }, 150);
 }
 
 /* auto-grow textarea */
-inpEl.addEventListener('input', () => {
-  inpEl.style.height = '44px';
-  if(inpEl.scrollHeight > 44) inpEl.style.height = Math.min(inpEl.scrollHeight, 120) + 'px';
+inpEl.addEventListener('input', function() {
+  this.style.height = '44px';
+  if(this.scrollHeight > 44) this.style.height = Math.min(this.scrollHeight, 120) + 'px';
 });
+
+} catch(err) {
+  /* last resort: if anything above crashed, at least show all content */
+  document.querySelectorAll('.r').forEach(function(el){ el.classList.add('on'); });
+  console.error('Script error:', err);
+}
 </script>
 </body>
 </html>
